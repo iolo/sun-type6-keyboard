@@ -1,7 +1,21 @@
 #include <SoftwareSerial.h>
+#include <Keyboard.h>
+
+#include "sun_scancode.h"
+#include "keymap.h"
+
+#define HID_KEYBOARD Keyboard
 
 #define CONSOLE Serial
 #define CONSOLE_BAUD 115200
+
+#ifdef CONSOLE
+#define LOG(...) CONSOLE.print(__VA_ARGS__)
+#define LOGLN(...) CONSOLE.println(__VA_ARGS__)
+#else
+#define LOG(...)
+#define LOGLN(...)
+#endif
 
 // HardwareSerial doesn't support inverse logic!
 //#define KEYBOARD Serial1
@@ -14,142 +28,361 @@ SoftwareSerial sun_type6_keyboard_serial(KEYBOARD_RX_PIN, KEYBOARD_TX_PIN, KEYBO
 #define KEYBOARD sun_type6_keyboard_serial
 #define KEYBOARD_BAUD 1200
 
-// #define MOUSE_RX_PIN 9
+// option1. use HardwareSerial with inverter
+// https://codeberg.org/xelalexv/suniversal
+#define MOUSE Serial1
+#define MOUSE_BAUD 1200
+#define MOUSE_CONFIG SERIAL_8N2
+
+// option2. another SoftwareSerial --> fail!!!
+// SoftwareSerial can listen a port at once!
+// https://docs.arduino.cc/tutorials/communication/TwoPortReceive
+//#define MOUSE_RX_PIN 9
 // RX only! don't write anything!
-// #define MOUSE_TX_PIN MOUSE_RX_PIN
-// #define MOUSE_INVERSE_LOGIC true
-// SoftwareSerial sun_type6_mouse_serial(MOUSE_RX_PIN, MOUSE_TX_PIN, MOUSE_INVERSE_LOGIC);
-// #define MOUSE sun_type6_mouse_serial
-// #define MOUSE_BAUD 1200
+//#define MOUSE_TX_PIN MOUSE_RX_PIN
+//#define MOUSE_INVERSE_LOGIC true
+//SoftwareSerial sun_type6_mouse_serial(MOUSE_RX_PIN, MOUSE_TX_PIN, MOUSE_INVERSE_LOGIC);
+//#define MOUSE sun_type6_mouse_serial
 
-enum SunCommand {
-  SUN_RESET_COMMAND = 0x01,
-  SUN_BELL_ON_COMMAND = 0x02,
-  SUN_BELL_OFF_COMMAND = 0x03,
-  SUN_CLICK_ON_COMMAND = 0x0a,
-  SUN_CLICK_OFF_COMMAND = 0x0b,
-  SUN_LED_COMMAND = 0x0e,
-  SUN_LAYOUT_COMMAND = 0x0f,
-};
+// option3. attachInterrupt() with serial processing?
+// https://www.arduino.cc/reference/ko/language/functions/external-interrupts/attachinterrupt/
+// Micro, Leonardo, other 32u4-based: 0, 1, 2, 3, 7
+//#define MOUSE_ISR_PIN 2
 
-enum SunLedMask {
-  SUN_NUM = 0x01,
-  SUN_COMPOSE = 0x02,
-  SUN_SCR = 0x04,
-  SUN_CAPS = 0x08,
-};
+#define SUN_COMMAND_RESET 0x01
+#define SUN_COMMAND_BELL_ON 0x02
+#define SUN_COMMAND_BELL_OFF 0x03
+#define SUN_COMMAND_CLICK_ON 0x0a
+#define SUN_COMMAND_CLICK_OFF 0x0b
+#define SUN_COMMAND_LED 0x0e
+#define SUN_COMMAND_LAYOUT 0x0f
 
-enum SunResponse {
-  SUN_RESPONSE_IDLE = 0x7f,
-  SUN_RESPONSE_LAYOUT = 0xfe,
-  SUN_RESPONSE_RESET = 0xff,
-  SUN_RESPONSE_RESET_OK = 0x04,
-  SUN_RESPONSE_RESET_FAIL = 0x7e,
-  SUN_RESPONSE_RESET_FAIL2 = 0x01,
-};
+#define SUN_LED_NUM_LOCK_MASK 0x01
+#define SUN_LED_COMPOSE_MASK 0x02
+#define SUN_LED_SCROLL_LOCK_MASK 0x04
+#define SUN_LED_CAPS_LOCK_MASK 0x08
 
-void setup() {
-  CONSOLE.begin(CONSOLE_BAUD);
-#ifdef KEYBOARD
-  KEYBOARD.begin(KEYBOARD_BAUD);
-#endif
-#ifdef MOUSE
-  MOUSE.begin(MOUSE_BAUD);
-#endif
-}
+#define SUN_RESPONSE_IDLE 0x7f
+#define SUN_RESPONSE_LAYOUT 0xfe
+#define SUN_RESPONSE_RESET 0xff
+
+#define SUN_RESPONSE_RESET_OK 0x04
+#define SUN_RESPONSE_RESET_FAIL 0x7e
+#define SUN_RESPONSE_RESET_FAIL2 0x01
+
+#define SUN_BREAK_MASK 0x80
 
 uint8_t led = 0;
 
+bool num_lock = false;
+bool caps_lock = false;
+bool scroll_lock = false;
+bool compose = false;
+bool shift_mode = false;
+bool ctrl_mode = false;
+bool alt_mode = false;
+bool meta_mode = false;
+
+void setup() {
+  init_console();
+  init_keyboard();
+  init_mouse();
+  init_hid_keyboard();
+}
+
 void loop() {
-#ifdef KEYBOARD
-  while (KEYBOARD.available()) {
-    uint8_t c = KEYBOARD.read();
-    if (c == 0) continue;
-    CONSOLE.print("kbd << ");
-    CONSOLE.print(c, HEX);
-    CONSOLE.println();
-    switch (c) {
-      case SUN_RESPONSE_RESET: CONSOLE.println("RESET"); break;
-      case SUN_RESPONSE_IDLE: CONSOLE.println("IDLE"); break;
-      case SUN_RESPONSE_LAYOUT: CONSOLE.println("LAYOUT"); break;
-    }
-  }
+  process_console();
+  process_keyboard();
+  process_mouse();
+}
+
+//
+//
+//
+
+void init_console() {
+#ifdef CONSOLE
+  CONSOLE.begin(CONSOLE_BAUD);
+  while (!CONSOLE) { delay(100); }
 #endif
-#ifdef MOUSE
-  while (MOUSE.available()) {
-    uint8_t c = MOUSE.read();
-    if (c == 0) continue;
-    CONSOLE.print("mouse << ");
-    CONSOLE.print(c, HEX);
-    CONSOLE.println();
-  }
-#endif
+}
+
+void process_console() {
+#ifdef CONSOLE
   if (CONSOLE.available()) {
     String s = CONSOLE.readStringUntil('\n');
     if (s == "ping") {
-      CONSOLE.println("pong!");
+      LOGLN("pong!");
     } else if (s == "reset") {
-      CONSOLE.println("reset!");
-      KEYBOARD.write(SUN_RESET_COMMAND);
+      LOGLN("reset!");
+      send_command(SUN_COMMAND_RESET);
     } else if (s == "bell on") {
-      CONSOLE.println("bell on!");
-      KEYBOARD.write(SUN_BELL_ON_COMMAND);
+      LOGLN("bell on!");
+      send_command(SUN_COMMAND_BELL_ON);
     } else if (s == "bell off") {
-      CONSOLE.println("bell off!");
-      KEYBOARD.write(SUN_BELL_OFF_COMMAND);
+      LOGLN("bell off!");
+      send_command(SUN_COMMAND_BELL_OFF);
     } else if (s == "click on") {
-      CONSOLE.println("click on");
-      KEYBOARD.write(SUN_CLICK_ON_COMMAND);
+      LOGLN("click on");
+      send_command(SUN_COMMAND_CLICK_ON);
     } else if (s == "click off") {
-      CONSOLE.println("click off!");
-      KEYBOARD.write(SUN_CLICK_OFF_COMMAND);
+      LOGLN("click off!");
+      send_command(SUN_COMMAND_CLICK_OFF);
     } else if (s == "caps on") {
-      CONSOLE.println("caps on!");
-      led_on(SUN_CAPS);
+      LOGLN("caps on!");
+      led_on(SUN_LED_CAPS_LOCK_MASK);
     } else if (s == "caps off") {
-      CONSOLE.println("caps off!");
-      led_off(SUN_CAPS);
+      LOGLN("caps off!");
+      led_off(SUN_LED_CAPS_LOCK_MASK);
     } else if (s == "num on") {
-      led_on(SUN_NUM);
+      led_on(SUN_LED_NUM_LOCK_MASK);
     } else if (s == "num off") {
-      CONSOLE.println("num off!");
-      led_off(SUN_NUM);
+      LOGLN("num off!");
+      led_off(SUN_LED_NUM_LOCK_MASK);
     } else if (s == "scr on") {
-      CONSOLE.println("scr on!");
-      led_on(SUN_SCR);
+      LOGLN("scr on!");
+      led_on(SUN_LED_SCROLL_LOCK_MASK);
     } else if (s == "scr off") {
-      CONSOLE.println("scr off!");
-      led_off(SUN_SCR);
+      LOGLN("scr off!");
+      led_off(SUN_LED_SCROLL_LOCK_MASK);
     } else if (s == "compose on") {
-      CONSOLE.println("compose on!");
-      led_on(SUN_COMPOSE);
+      LOGLN("compose on!");
+      led_on(SUN_LED_COMPOSE_MASK);
     } else if (s == "compose off") {
-      CONSOLE.println("compose off!");
-      led_off(SUN_COMPOSE);
+      LOGLN("compose off!");
+      led_off(SUN_LED_COMPOSE_MASK);
     } else if (s == "layout") {
-      CONSOLE.println("layout!");
-      KEYBOARD.write(SUN_LAYOUT_COMMAND);
+      LOGLN("layout!");
+      send_command(SUN_COMMAND_LAYOUT);
     } else {
-      CONSOLE.println("unknown command!");
+      LOGLN("unknown command!");
     }
   }
+#endif
+}
+
+//
+//
+//
+
+void init_keyboard() {
+#ifdef KEYBOARD
+  KEYBOARD.begin(KEYBOARD_BAUD);
+#endif
+}
+
+void process_keyboard() {
+#ifdef KEYBOARD
+  // https://docs.arduino.cc/tutorials/communication/TwoPortReceive
+  // KEYBOARD.listen();
+  while (KEYBOARD.available()) {
+    uint8_t c = KEYBOARD.read();
+    if (c == 0) break;
+    LOG("kbd << ");
+    LOG(c, HEX);
+    switch (c) {
+      case SUN_RESPONSE_RESET: LOG("(RESET)"); break;
+      case SUN_RESPONSE_IDLE: LOG("(IDLE)"); break;
+      case SUN_RESPONSE_LAYOUT: LOG("(LAYOUT)"); break;
+      case SUN_POWER:
+        send_command(SUN_COMMAND_RESET);
+        break;
+      default:
+        uint8_t scan_code = c & 0x7f;
+        bool pressed = (c & 0x80) == 0;
+        // toggle keys
+        switch (c) {
+          case SUN_NUM_LOCK:
+            num_lock = !num_lock;
+            if (num_lock) {
+              led_on(SUN_LED_NUM_LOCK_MASK);
+            } else {
+              led_off(SUN_LED_NUM_LOCK_MASK);
+            }
+            break;
+          case SUN_CAPS_LOCK:
+            caps_lock = !caps_lock;
+            if (caps_lock) {
+              led_on(SUN_LED_CAPS_LOCK_MASK);
+            } else {
+              led_off(SUN_LED_CAPS_LOCK_MASK);
+            }
+            break;
+          case SUN_SCROLL_LOCK:
+            scroll_lock = !scroll_lock;
+            if (scroll_lock) {
+              led_on(SUN_LED_SCROLL_LOCK_MASK);
+            } else {
+              led_off(SUN_LED_SCROLL_LOCK_MASK);
+            }
+            break;
+          case SUN_COMPOSE:
+            compose = !compose;
+            if (compose) {
+              led_on(SUN_LED_COMPOSE_MASK);
+            } else {
+              led_off(SUN_LED_COMPOSE_MASK);
+            }
+            break;
+        }
+        // mode keys
+        switch (scan_code) {
+          case SUN_LEFT_SHIFT:
+          case SUN_RIGHT_SHIFT:
+            shift_mode = pressed;
+            break;
+          case SUN_LEFT_CTRL:
+          //case SUN_RIGHT_CTRL:
+            ctrl_mode = pressed;
+            break;
+          case SUN_LEFT_ALT:
+            //case SUN_RIGHT_ALT:
+            alt_mode = pressed;
+            break;
+          case SUN_LEFT_META:
+          case SUN_RIGHT_META:
+            meta_mode = pressed;
+            break;
+        }
+        // translate to hid key press/release...
+        KeymapEntry entry = SUN_TO_USB_KEYMAP[scan_code];
+        LOG(c, HEX);
+        LOG(pressed ? " up " : " dn ");
+        LOG(entry.name);
+        LOG(" -> ");
+        uint8_t key = entry.normal;
+        // arduino keyboard library doesn't use original scan code but performs unexpected translation!
+        // TODO: special cases!
+        if (pressed) {
+          hid_key_press(key);
+        } else {
+          hid_key_release(key);
+        }
+        break;
+    }
+    LOGLN();
+  }
+#endif
+}
+
+void send_command(uint8_t command) {
+#ifdef KEYBOARD
+  KEYBOARD.write(command);
+#else
+  LOG("*send_command:");
+  LOG(command, HEX);
+  LOGLN();
+#endif
 }
 
 void led_on(uint8_t mask) {
-  set_led(led | mask);
+  send_led_command(led | mask);
 }
 
 void led_off(uint8_t mask) {
-  set_led(led & ~mask);
+  send_led_command(led & ~mask);
 }
 
-void set_led(uint8_t new_led) {
-  CONSOLE.print(">> led: ");
-  CONSOLE.print(led, HEX);
-  CONSOLE.print("->");
-  CONSOLE.print(new_led, HEX);
-  CONSOLE.println();
-  led = new_led;
-  KEYBOARD.write(SUN_LED_COMMAND);
+void send_led_command(uint8_t arg) {
+  LOG("kbd >> led: ");
+  LOG(arg, BIN);
+  LOG("->");
+  LOG(arg, BIN);
+  LOGLN();
+  led = arg;
+  send_command(SUN_COMMAND_LED);
+#ifdef KEYBOARD
   KEYBOARD.write(led);
+#else
+  LOG(">> led=");
+  LOG(led, HEX);
+  LOGLN();
+#endif
+}
+
+//
+//
+//
+
+void init_mouse() {
+#ifdef MOUSE
+  MOUSE.begin(MOUSE_BAUD, SERIAL_8N2);
+#endif
+#ifdef MOUSE_ISR_PIN
+  pinMode(MOUSE_ISR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(MOUSE_ISR_PIN), mouse_isr, CHANGE);
+#endif
+}
+
+volatile uint8_t mouse_buf[100];
+volatile int mouse_buf_head = 0;
+volatile int mouse_buf_tail = 0;
+
+void process_mouse() {
+#ifdef MOUSE
+  // https://docs.arduino.cc/tutorials/communication/TwoPortReceive
+  //MOUSE.listen();
+  if (MOUSE.available()) {
+    LOG("mouse << ");
+    while (MOUSE.available()) {
+      uint8_t c = MOUSE.read();
+      if (c == 0) continue;
+      LOG(c, HEX);
+    }
+    LOGLN();
+  }
+#endif
+#ifdef MOUSE_ISR_PIN
+  if (mouse_buf_head != mouse_buf_tail) {
+    LOG("mouse_isr << ");
+    while (mouse_buf_head != mouse_buf_tail) {
+      LOG(mouse_buf[mouse_buf_head]);
+      LOG(" ");
+      if (++mouse_buf_head > sizeof(mouse_buf)) {
+        mouse_buf_head = 0;
+      }
+    }
+    LOGLN();
+  }
+#endif
+}
+
+void mouse_isr() {
+#ifdef MOUSE_ISR_PIN
+  uint8_t state = digitalRead(MOUSE_ISR_PIN);
+  mouse_buf[mouse_buf_tail] = state;
+  if (++mouse_buf_tail > sizeof(mouse_buf)) {
+    mouse_buf_tail = 0;
+  }
+#endif
+}
+
+//
+// HID keyboard
+//
+
+void init_hid_keyboard() {
+#ifdef HID_KEYBOARD
+  HID_KEYBOARD.begin();
+#endif
+}
+
+void hid_key_press(uint8_t key) {
+  if (key == 0) return;
+#ifdef HID_KEYBOARD
+  HID_KEYBOARD.press(key);
+#endif
+  LOG("hid key press ");
+  LOG(key, HEX);
+  LOGLN();
+}
+
+void hid_key_release(uint8_t key) {
+  if (key == 0) return;
+#ifdef HID_KEYBOARD
+  HID_KEYBOARD.release(key);
+#endif
+  LOG("hid key release ");
+  LOG(key, HEX);
+  LOGLN();
 }
